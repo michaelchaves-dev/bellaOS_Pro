@@ -23,7 +23,10 @@ routing and budget for EVERY proposed step before it may execute.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -33,6 +36,7 @@ from pathlib import Path
 
 __all__ = [
     "INTAKE_STAGES",
+    "OWNER_UNBOUND_WARNING",
     "Authority",
     "AuthorityError",
     "Claim",
@@ -74,6 +78,8 @@ class RunStatus(Enum):
     DENIED = "DENIED"                          # capability/authority failure
     AWAITING_APPROVAL = "AWAITING_APPROVAL"    # ASK_FIRST halt
     BUDGET_HALTED = "BUDGET_HALTED"            # hard budget ceiling reached
+    ABORTED = "ABORTED"                        # unexpected error mid-run (item 5)
+    INCOMPLETE = "INCOMPLETE"                  # required capabilities unexecuted (item 6)
 
 
 # ---------------------------------------------------------------------------
@@ -86,18 +92,36 @@ class AuthorityError(Exception):
 
 @dataclass(frozen=True)
 class Principal:
-    """An actor identity. Only the owner principal carries authority."""
+    """An actor identity. Only the owner principal carries authority.
+
+    ``credential`` is the owner secret presented to a *bound*
+    Authority (see Authority(owner_secret=...)). It is carried by the
+    principal, never stored on the Authority, never receipted, and
+    excluded from repr."""
 
     name: str
     role: str  # "owner" | "requester" | "agent" | "content"
+    credential: "str | bytes | None" = field(default=None, repr=False)
 
     @classmethod
-    def owner(cls, name: str = "owner") -> "Principal":
-        return cls(name=name, role="owner")
+    def owner(
+        cls, name: str = "owner", credential: "str | bytes | None" = None
+    ) -> "Principal":
+        return cls(name=name, role="owner", credential=credential)
 
     @property
     def is_owner(self) -> bool:
         return self.role == "owner"
+
+
+_PBKDF2_ITERATIONS = 100_000
+
+OWNER_UNBOUND_WARNING = (
+    "OWNER_UNBOUND: this Authority is not bound to an owner credential. "
+    "Anyone who can construct a Principal with role 'owner' can set the "
+    "permission dial. Unbound mode is for development only — bind the "
+    "Authority to an owner secret before trusting its dial."
+)
 
 
 class Authority:
@@ -112,10 +136,72 @@ class Authority:
     CAPABILITY != AUTHORITY: this table says what is *allowed*; the set
     of held capabilities (passed to the supervisor separately) says
     what is *possible*. Both must line up before anything executes.
+
+    Owner binding (strengthening pass, F-01): an Authority constructed
+    with ``owner_secret`` is *bound* — set_permission then additionally
+    requires the principal's credential to verify against the salted
+    PBKDF2 digest kept here. A bare role string ("owner") is no longer
+    enough. An unbound Authority keeps the legacy behavior but every
+    run under it is receipted OWNER_UNBOUND (dev-only mode).
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        owner_secret: "str | bytes | None" = None,
+        *,
+        salt: "bytes | None" = None,
+    ) -> None:
         self._levels: dict[str, PermissionLevel] = {}
+        self._listeners: list = []
+        self._owner_salt: "bytes | None" = None
+        self._owner_digest: "bytes | None" = None
+        if owner_secret is not None:
+            # Owner binding (F-01 fix): keep ONLY a salted PBKDF2
+            # digest of the owner's secret. The secret itself is
+            # never stored, never receipted, never returned.
+            self._owner_salt = (
+                bytes(salt) if salt is not None else os.urandom(16)
+            )
+            self._owner_digest = self._derive(owner_secret, self._owner_salt)
+
+    @staticmethod
+    def _derive(secret: "str | bytes", salt: bytes) -> bytes:
+        if isinstance(secret, str):
+            secret = secret.encode("utf-8")
+        return hashlib.pbkdf2_hmac(
+            "sha256", bytes(secret), salt, _PBKDF2_ITERATIONS
+        )
+
+    @property
+    def owner_bound(self) -> bool:
+        """True when this Authority is bound to an owner secret."""
+        return self._owner_digest is not None
+
+    def _credential_verifies(self, principal) -> bool:
+        credential = getattr(principal, "credential", None)
+        if credential is None:
+            return False
+        try:
+            candidate = self._derive(credential, self._owner_salt)
+        except Exception:
+            return False
+        return hmac.compare_digest(candidate, self._owner_digest)
+
+    def add_change_listener(self, fn) -> bool:
+        """Register a callback invoked after every successful
+        set_permission with a change dict {actor, capability,
+        old_level, new_level, ts} — never any credential. Returns
+        True if newly registered (False if already present)."""
+        if fn in self._listeners:
+            return False
+        self._listeners.append(fn)
+        return True
+
+    def remove_change_listener(self, fn) -> bool:
+        if fn in self._listeners:
+            self._listeners.remove(fn)
+            return True
+        return False
 
     def set_permission(
         self,
@@ -129,9 +215,31 @@ class Authority:
                 "only the owner principal may set authority; "
                 "content cannot grant authority"
             )
+        if self.owner_bound and not self._credential_verifies(principal):
+            raise AuthorityError(
+                "this authority is bound to an owner credential and "
+                "the presented credential does not verify; a role "
+                "string alone is not the owner (F-01)"
+            )
         if isinstance(level, str):
             level = PermissionLevel[level]
-        self._levels[str(capability)] = level
+        cap = str(capability)
+        old = self._levels.get(cap)
+        self._levels[cap] = level
+        change = {
+            "actor": principal.name,
+            "capability": cap,
+            "old_level": old.name if old is not None else None,
+            "new_level": level.name,
+            "ts": time.time(),
+        }
+        for fn in list(self._listeners):
+            try:
+                fn(change)
+            except Exception:
+                # A broken listener (e.g. an unwritable store) must
+                # not corrupt the dial or mask the change itself.
+                pass
 
     def level_for(self, capability: str) -> "PermissionLevel | None":
         """Return the dial level for a capability, or None if unset.
@@ -251,10 +359,15 @@ class ReceiptLog:
     """Append-only receipt chain. Every stage and every step writes
     exactly one receipt; a run's record is complete only if the chain is
     whole and in order (NO SILENT ESCALATION — every refusal, halt and
-    injection attempt lands here)."""
+    injection attempt lands here).
 
-    def __init__(self) -> None:
+    An optional ``sink`` callable (Slice 2) receives each receipt at
+    the moment it is added — e.g. a persistent receipt store writing
+    it to disk. Default None: in-memory only, behavior unchanged."""
+
+    def __init__(self, sink=None) -> None:
         self.receipts: list[dict] = []
+        self._sink = sink
 
     def add(self, stage: str, status: str, **details) -> dict:
         receipt = {
@@ -265,6 +378,8 @@ class ReceiptLog:
             "details": details,
         }
         self.receipts.append(receipt)
+        if self._sink is not None:
+            self._sink(receipt)
         return receipt
 
     def write_jsonl(self, path: "str | Path") -> None:
@@ -330,16 +445,42 @@ def _load_registry(reuse_registry) -> dict:
     return dict(data)
 
 
+def _money_or_problem(value, label: str):
+    """Validate one money input. Returns (Decimal|None, problem|None).
+
+    NaN, Infinity and negative amounts are refused HERE, at intake,
+    so they can never surface as a mid-loop exception (F-03)."""
+    if value is None:
+        return None, None
+    try:
+        amount = value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception:
+        return None, f"{label} {value!r} is not a valid decimal amount"
+    if not amount.is_finite():
+        return None, f"{label} must be a finite amount, got {value!r}"
+    if amount < 0:
+        return None, f"{label} must not be negative, got {value!r}"
+    return amount, None
+
+
 def run_intake(
     task: str,
     contract: ScopeContract,
     log: ReceiptLog,
     *,
     reuse_registry=None,
+    authority: "Authority | None" = None,
+    run_budget=None,
+    routes=(),
 ) -> IntakeOutcome:
     """Run the intake stages once. On a block, the returned outcome
     carries the halting stage and reason; the caller must not proceed
-    to the step loop."""
+    to the step loop.
+
+    ``authority`` / ``run_budget`` / ``routes`` are optional context
+    the supervisor supplies so the ScopeContract stage can validate
+    every money input and snapshot the permission dial into the
+    receipts (strengthening pass, F-01/F-03)."""
 
     # -- Step Zero: frame the task; screen content for authority claims.
     content_surfaces = [
@@ -414,12 +555,69 @@ def run_intake(
         missing.append("output_contract")
     if not contract.requester_name().strip():
         missing.append("requester")
-    if missing:
-        reason = (
-            "ScopeContract: contract is incomplete or inconsistent; "
-            f"missing/invalid: {', '.join(missing)}. Run blocked (fail closed)."
+
+    # -- Money validation (F-03): the contract budget is authoritative.
+    #    A run-level budget may only TIGHTEN it, never loosen it. Every
+    #    money input (contract budget, run budget, route costs) must
+    #    be a finite, non-negative Decimal — anything else is a clean
+    #    BLOCKED here, never an exception mid-loop.
+    problems: list[str] = []
+    contract_amount, problem = _money_or_problem(
+        contract.budget, "contract budget"
+    )
+    if problem:
+        problems.append(problem)
+    run_amount, problem = _money_or_problem(run_budget, "run budget")
+    if problem:
+        problems.append(problem)
+    for route in routes or ():
+        try:
+            route_name = getattr(route, "name", "?")
+            route_cost = route.cost
+        except Exception as exc:
+            problems.append(
+                f"route {route_name!r} cost could not be read "
+                f"({type(exc).__name__})"
+            )
+            continue
+        _, problem = _money_or_problem(
+            route_cost, f"route {route_name!r} cost"
         )
-        log.add("ScopeContract", "BLOCKED", reason=reason, missing=missing)
+        if problem:
+            problems.append(problem)
+    if (
+        contract_amount is not None
+        and run_amount is not None
+        and run_amount > contract_amount
+    ):
+        problems.append(
+            f"run budget {run_amount} would loosen the contract budget "
+            f"{contract_amount}; refused — the contract budget is "
+            "authoritative and a run-level budget may only tighten it"
+        )
+
+    if missing or problems:
+        parts = []
+        if missing:
+            parts.append(
+                "contract is incomplete or inconsistent; "
+                f"missing/invalid: {', '.join(missing)}"
+            )
+        if problems:
+            parts.append(
+                "money inputs invalid or refused: " + "; ".join(problems)
+            )
+        reason = (
+            "ScopeContract: " + ". ".join(parts)
+            + ". Run blocked (fail closed)."
+        )
+        log.add(
+            "ScopeContract",
+            "BLOCKED",
+            reason=reason,
+            missing=missing,
+            problems=problems,
+        )
         return IntakeOutcome(
             blocked=True,
             status=RunStatus.BLOCKED,
@@ -427,13 +625,34 @@ def run_intake(
             reasons=[reason],
             reuse_hits=hits,
         )
-    log.add(
-        "ScopeContract",
-        "PASS",
+
+    amounts = [a for a in (contract_amount, run_amount) if a is not None]
+    effective_budget = min(amounts) if amounts else None
+    # Authority context, frozen into the receipts (item 4): the complete
+    # dial state at run start plus its hash, so the run's authority
+    # context is provable afterward and immune to later dial changes.
+    dial_snapshot = authority.snapshot() if authority is not None else {}
+    dial_snapshot_hash = hashlib.sha256(
+        json.dumps(
+            dial_snapshot, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    owner_bound = authority.owner_bound if authority is not None else False
+    scope_details = dict(
         scope=contract.scope,
         output_contract=contract.output_contract,
         budget=(str(contract.budget) if contract.budget is not None else None),
+        run_budget=(str(run_amount) if run_amount is not None else None),
+        effective_budget=(
+            str(effective_budget) if effective_budget is not None else None
+        ),
+        owner_bound=owner_bound,
+        dial_snapshot=dial_snapshot,
+        dial_snapshot_hash=dial_snapshot_hash,
     )
+    if not owner_bound:
+        scope_details["owner_warning"] = OWNER_UNBOUND_WARNING
+    log.add("ScopeContract", "PASS", **scope_details)
 
     # -- Evidence labeling: every claim carries its ternary label.
     labeled = [c.as_dict() for c in contract.claims]

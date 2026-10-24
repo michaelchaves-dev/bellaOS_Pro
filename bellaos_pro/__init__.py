@@ -6,6 +6,7 @@ README_BUILD.md for the honest evidence state.
 
 from .kernel import (
     INTAKE_STAGES,
+    OWNER_UNBOUND_WARNING,
     Authority,
     AuthorityError,
     Claim,
@@ -20,6 +21,12 @@ from .kernel import (
     run_intake,
     scan_for_injection,
 )
+from .receipts import (
+    ZERO_HASH,
+    ReceiptStore,
+    VerifyResult,
+    verify_chain,
+)
 from .supervisor import (
     ProposedStep,
     Route,
@@ -31,6 +38,7 @@ from .supervisor import (
 
 __all__ = [
     "INTAKE_STAGES",
+    "OWNER_UNBOUND_WARNING",
     "Authority",
     "AuthorityError",
     "Claim",
@@ -40,14 +48,18 @@ __all__ = [
     "Principal",
     "ProposedStep",
     "ReceiptLog",
+    "ReceiptStore",
     "Route",
     "RouteTable",
     "RunResult",
     "RunStatus",
     "ScopeContract",
     "Supervisor",
+    "VerifyResult",
+    "ZERO_HASH",
     "receipts_chain_complete",
     "run_intake",
     "run_pipeline",
     "scan_for_injection",
+    "verify_chain",
 ]
